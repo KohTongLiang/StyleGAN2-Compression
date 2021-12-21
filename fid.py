@@ -63,40 +63,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Calculate FID scores")
 
     parser.add_argument("--truncation", type=float, default=1, help="truncation factor")
-    parser.add_argument(
-        "--truncation_mean",
-        type=int,
-        default=4096,
-        help="number of samples to calculate mean for truncation",
-    )
-    parser.add_argument(
-        "--batch", type=int, default=64, help="batch size for the generator"
-    )
-    parser.add_argument(
-        "--n_sample",
-        type=int,
-        default=50000,
-        help="number of the samples for calculating FID",
-    )
-    parser.add_argument(
-        "--size", type=int, default=256, help="image sizes for generator"
-    )
-    parser.add_argument(
-        "--inception",
-        type=str,
-        default=None,
-        required=True,
-        help="path to precomputed inception embedding",
-    )
-    parser.add_argument(
-        "ckpt", metavar="CHECKPOINT", help="path to generator checkpoint"
-    )
+    parser.add_argument("--truncation_mean",type=int,default=4096,help="number of samples to calculate mean for truncation",)
+    parser.add_argument("--batch", type=int, default=64, help="batch size for the generator")
+    parser.add_argument("--n_sample",type=int,default=50000,help="number of the samples for calculating FID",)
+    parser.add_argument("--size", type=int, default=256, help="image sizes for generator")
+    parser.add_argument("--inception",type=str,default=None,required=True,help="path to precomputed inception embedding",)
+    parser.add_argument("--ckpt", metavar="CHECKPOINT", help="path to generator checkpoint")
+    parser.add_argument("--channel_multiplier", type=int, default=2, help="Channel multiplier. Use value that model was trained with")
 
     args = parser.parse_args()
 
     ckpt = torch.load(args.ckpt)
 
-    g = Generator(args.size, 512, 8).to(device)
+    g = Generator(args.size, 512, 8, channel_multiplier=args.channel_multiplier).to(device)
     g.load_state_dict(ckpt["g_ema"])
     g = nn.DataParallel(g)
     g.eval()
@@ -104,7 +83,6 @@ if __name__ == "__main__":
     if args.truncation < 1:
         with torch.no_grad():
             mean_latent = g.mean_latent(args.truncation_mean)
-
     else:
         mean_latent = None
 

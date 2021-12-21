@@ -334,7 +334,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
-    parser.add_argument("path", type=str, help="path to the lmdb dataset")
+    parser.add_argument("--path", type=str, help="path to the lmdb dataset")
     parser.add_argument('--arch', type=str, default='stylegan2', help='model architectures (stylegan2 | swagan)')
     parser.add_argument(
         "--iter", type=int, default=800000, help="total training iterations"
@@ -451,13 +451,24 @@ if __name__ == "__main__":
 
     generator = Generator(
         args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
-    ).to(device)
+    )
+
+    # run in multiple gpu
+    # generator = nn.DataParallel(generator)
+    generator.to(device)
+
     discriminator = Discriminator(
         args.size, channel_multiplier=args.channel_multiplier
-    ).to(device)
+    )
+
+    # discriminator = nn.DataParallel(discriminator)
+    discriminator.to(device)
+
     g_ema = Generator(
         args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
-    ).to(device)
+    )
+    # g_ema = nn.DataParallel(g_ema)
+    g_ema.to(device)
     g_ema.eval()
     accumulate(g_ema, generator, 0)
 
