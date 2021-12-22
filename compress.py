@@ -123,6 +123,7 @@ def set_grad_none(model, targets):
             p.grad = None
 
 # kernel alignment for knowledge distillation
+# find similarity index between 2 tensors
 def KA(X, Y):
     X_ = X.view(X.size(0), -1)
     Y_ = Y.view(Y.size(0), -1)
@@ -133,7 +134,7 @@ def KA(X, Y):
     ret = (X_vec * Y_vec).sum() / ((X_vec**2).sum() * (Y_vec**2).sum())**0.5
     return ret
 
-def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
+def train(args, loader, generator, discriminator, student_generator, student_discriminator, g_optim, d_optim, g_ema, student_g_ema, device):
     loader = sample_data(loader)
 
     pbar = range(args.iter)
@@ -349,6 +350,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch", type=int, default=16, help="batch sizes for each gpus")
     parser.add_argument("--n_sample",type=int,default=64,help="number of the samples generated during training",)
     parser.add_argument("--size", type=int, default=256, help="image sizes for the model")
+    parser.add_argument("--size_s", type=int, default=256, help="image sizes for the student model")
     parser.add_argument("--r1", type=float, default=10, help="weight of the r1 regularization")
     parser.add_argument("--path_regularize",type=float,default=2,help="weight of the path length regularization",)
     parser.add_argument("--path_batch_shrink",type=int,default=2,help="batch size reducing factor for the path length regularization (reduce memory consumption)",)
@@ -358,6 +360,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt",type=str,default=None,help="path to the checkpoints to resume training",)
     parser.add_argument("--lr", type=float, default=0.002, help="learning rate")
     parser.add_argument("--channel_multiplier",type=int,default=2,help="channel multiplier factor for the model. config-f = 2, else = 1",)
+    parser.add_argument("--channel_multiplier_s",type=int,default=1,help="channel multiplier factor for the student model. config-f = 2, else = 1",)
     parser.add_argument("--wandb", action="store_true", help="use weights and biases logging")
     parser.add_argument("--local_rank", type=int, default=0, help="local rank for distributed training")
     parser.add_argument("--augment", action="store_true", help="apply non leaking augmentation")
@@ -387,26 +390,18 @@ if __name__ == "__main__":
     elif args.arch == 'swagan':
         from swagan import Generator, Discriminator
 
+    # Teacher network
     generator = Generator(
         args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
-    )
-
-    # run in multiple gpu
-    # generator = nn.DataParallel(generator)
-    generator.to(device)
+    ).to(device)
 
     discriminator = Discriminator(
         args.size, channel_multiplier=args.channel_multiplier
-    )
-
-    # discriminator = nn.DataParallel(discriminator)
-    discriminator.to(device)
+    ).to(device)
 
     g_ema = Generator(
         args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
-    )
-    # g_ema = nn.DataParallel(g_ema)
-    g_ema.to(device)
+    ).to(device)
     g_ema.eval()
     accumulate(g_ema, generator, 0)
 
@@ -443,6 +438,22 @@ if __name__ == "__main__":
         g_optim.load_state_dict(ckpt["g_optim"])
         d_optim.load_state_dict(ckpt["d_optim"])
 
+    # Student network
+    student_generator = Generator(
+        args.size_s, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier_s
+    ).to(device)
+
+    student_discriminator = Discriminator(
+        args.size_s, channel_multiplier=args.channel_multiplier_s
+    ).to(device)
+
+    student_g_ema = Generator(
+        args.size_s, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier_s
+    ).to(device)
+    student_g_ema.eval()
+    accumulate(student_g_ema, student_generator, 0)
+
+    # for distributed training
     if args.distributed:
         generator = nn.parallel.DistributedDataParallel(
             generator,
@@ -452,6 +463,20 @@ if __name__ == "__main__":
         )
 
         discriminator = nn.parallel.DistributedDataParallel(
+            discriminator,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            broadcast_buffers=False,
+        )
+
+        student_generator = nn.parallel.DistributedDataParallel(
+            generator,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            broadcast_buffers=False,
+        )
+
+        student_discriminator = nn.parallel.DistributedDataParallel(
             discriminator,
             device_ids=[args.local_rank],
             output_device=args.local_rank,
@@ -477,4 +502,4 @@ if __name__ == "__main__":
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project="stylegan 2")
 
-    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device)
+    train(args, loader, generator, discriminator, student_generator, student_discriminator, g_optim, d_optim, g_ema, student_g_ema, device)

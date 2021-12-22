@@ -500,6 +500,7 @@ class Generator(nn.Module):
         self,
         styles,
         return_latents=False,
+        return_f_maps=False,
         inject_index=None,
         truncation=1,
         truncation_latent=None,
@@ -552,22 +553,24 @@ class Generator(nn.Module):
         skip = self.to_rgb1(out, latent[:, 1])
 
         i = 1
+        f_maps = []
         for conv1, conv2, noise1, noise2, to_rgb in zip(
             self.convs[::2], self.convs[1::2], noise[1::2], noise[2::2], self.to_rgbs
         ):
             out = conv1(out, latent[:, i], noise=noise1)
             out = conv2(out, latent[:, i + 1], noise=noise2)
             skip = to_rgb(out, latent[:, i + 2], skip)
-
+            f_maps.append(skip)
             i += 2
 
         image = skip
 
-        if return_latents:
-            return image, latent
-
+        if return_f_maps:
+            return image, latent, f_maps
+        elif return_latents:
+            return image, latent, None
         else:
-            return image, None
+            return image, None, None
 
 
 class ConvLayer(nn.Sequential):
