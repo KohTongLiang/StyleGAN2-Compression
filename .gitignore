@@ -6,6 +6,7 @@ output/*
 ffhq/*
 # C extensions
 *.so
+lpips/*
 
 # Distribution / packaging
 .Python
