@@ -5,19 +5,19 @@ import os
 
 import numpy as np
 import torch
+import torch.distributed as dist
+import lpips
 from torch import nn, autograd, optim
 from torch.nn import functional as F
 from torch.utils import data
-import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 try:
     import wandb
-
 except ImportError:
     wandb = None
-
 
 from dataset import MultiResolutionDataset
 from distributed import (
@@ -134,15 +134,24 @@ def KA(X, Y):
     ret = (X_vec * Y_vec).sum() / ((X_vec**2).sum() * (Y_vec**2).sum())**0.5
     return ret
 
+# train student model
 def train(args, loader, generator, discriminator, student_generator, student_discriminator, g_optim, d_optim, g_ema, student_g_ema, device):
+    # create directories
+    save_dir = args.expr_dir
+    os.makedirs(save_dir, 0o777, exist_ok=True)
+    os.makedirs(save_dir + "/checkpoints", 0o777, exist_ok=True)
+    os.makedirs(save_dir + "/sample", 0o777, exist_ok=True)
+    
     loader = sample_data(loader)
-
     pbar = range(args.iter)
 
     if get_rank() == 0:
         pbar = tqdm(pbar, initial=args.start_iter, dynamic_ncols=True, smoothing=0.01)
 
     mean_path_length = 0
+
+    # create lips model
+    loss_fn_vgg = lpips.PerceptualLoss(net='vgg')
 
     d_loss_val = 0
     r1_loss = torch.tensor(0.0, device=device)
@@ -153,12 +162,11 @@ def train(args, loader, generator, discriminator, student_generator, student_dis
     loss_dict = {}
 
     if args.distributed:
-        g_module = generator.module
-        d_module = discriminator.module
-
+        g_module = student_generator.module
+        d_module = student_discriminator.module
     else:
-        g_module = generator
-        d_module = discriminator
+        g_module = student_generator
+        d_module = student_discriminator
 
     accum = 0.5 ** (32 / (10 * 1000))
     ada_aug_p = args.augment_p if args.augment_p > 0 else 0.0
@@ -174,77 +182,122 @@ def train(args, loader, generator, discriminator, student_generator, student_dis
 
         if i > args.iter:
             print("Done!")
-
             break
 
         real_img = next(loader)
         real_img = real_img.to(device)
 
+                            ###########################
+                            ### Train Discriminator ###
+                            ###########################
+
         requires_grad(generator, False)
-        requires_grad(discriminator, True)
+        requires_grad(student_generator, False)
+        requires_grad(student_discriminator, True)
 
+        # generate noise and fake image with it
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(noise)
+        fake_img_s, _, _ = student_generator(noise)
 
+        ## Perform data augmentation if augment is set in arguments
         if args.augment:
             real_img_aug, _ = augment(real_img, ada_aug_p)
-            fake_img, _ = augment(fake_img, ada_aug_p)
-
+            fake_img_s, _ = augment(fake_img_s, ada_aug_p)
         else:
             real_img_aug = real_img
 
-        fake_pred = discriminator(fake_img)
-        real_pred = discriminator(real_img_aug)
+        # real_img_aug = F.interpolate(real_img_aug, args.size_s, mode="bilinear")
+
+        # make prediction
+        fake_pred = student_discriminator(fake_img_s)
+        real_pred = student_discriminator(real_img_aug)
+
         d_loss = d_logistic_loss(real_pred, fake_pred)
 
-        loss_dict["d"] = d_loss
+        loss_dict['d'] = d_loss
         loss_dict["real_score"] = real_pred.mean()
         loss_dict["fake_score"] = fake_pred.mean()
 
-        discriminator.zero_grad()
+        student_discriminator.zero_grad()
         d_loss.backward()
         d_optim.step()
 
+        # augmentation to real prediction
         if args.augment and args.augment_p == 0:
             ada_aug_p = ada_augment.tune(real_pred)
             r_t_stat = ada_augment.r_t_stat
 
+        # Discriminator regularisation
         d_regularize = i % args.d_reg_every == 0
-
         if d_regularize:
             real_img.requires_grad = True
 
             if args.augment:
                 real_img_aug, _ = augment(real_img, ada_aug_p)
-
             else:
                 real_img_aug = real_img
 
-            real_pred = discriminator(real_img_aug)
+            # real_img_aug = F.interpolate(real_img_aug, args.size_s, mode="bilinear")
+
+            real_pred = student_discriminator(real_img_aug)
             r1_loss = d_r1_loss(real_pred, real_img)
 
-            discriminator.zero_grad()
+            student_discriminator.zero_grad()
             (args.r1 / 2 * r1_loss * args.d_reg_every + 0 * real_pred[0]).backward()
 
             d_optim.step()
 
         loss_dict["r1"] = r1_loss
+                            
+                            ##################################
+                            ### End of Train Discriminator ###
+                            ##################################
 
+                                #######################
+                                ### Train Generator ###
+                                #######################
+
+        requires_grad(student_generator, True)
         requires_grad(generator, True)
-        requires_grad(discriminator, False)
+        requires_grad(student_discriminator, False)
 
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(noise)
+        fake_img_t, _, f_maps_t = generator(noise, return_f_maps=True)
+        fake_img_s, _, f_maps_s = student_generator(noise, return_f_maps=True)
 
         if args.augment:
-            fake_img, _ = augment(fake_img, ada_aug_p)
+            fake_img_t, _ = augment(fake_img_t, ada_aug_p)
+            fake_img_s, _ = augment(fake_img_s, ada_aug_p)
 
-        fake_pred = discriminator(fake_img)
-        g_loss = g_nonsaturating_loss(fake_pred)
+        # upsample the output of the student generator
+        down_fake_img_t = F.interpolate(fake_img_t, args.size_s, mode="bilinear")
 
+        # adverserial loss
+        fake_pred_s = student_discriminator(fake_img_s)
+        g_loss = g_nonsaturating_loss(fake_pred_s)
+
+        # Kernel Alignment
+        if args.kernel_alignment:
+            dist_loss = 0 # for knowledge distillation
+            for f_s, f_t in zip(f_maps_s, f_maps_t):
+                f_t = F.interpolate(f_t, args.size_s, mode="bilinear")
+                dist_loss += KA(f_s, f_t)
+            dist_loss = -dist_loss # we want to maximise it
+            g_loss = g_loss + dist_loss
+
+
+        # Perceptual Loss
+        # causes stack expects each tensor to be equal size, but got [4, 1, 1, 1] at entry 0 and [] at entry 1
+        # error in distributed setting.
+        if args.perc_loss:
+            perc_loss = 0
+            perc_loss = loss_fn_vgg(fake_img_s, down_fake_img_t)
+            g_loss = g_loss + perc_loss.mean()
+
+        # adv + perc + ka
         loss_dict["g"] = g_loss
 
-        generator.zero_grad()
+        student_generator.zero_grad()
         g_loss.backward()
         g_optim.step()
 
@@ -253,13 +306,13 @@ def train(args, loader, generator, discriminator, student_generator, student_dis
         if g_regularize:
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
             noise = mixing_noise(path_batch_size, args.latent, args.mixing, device)
-            fake_img, latents = generator(noise, return_latents=True)
+            fake_img, latents, _ = student_generator(noise, return_latents=True)
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
                 fake_img, latents, mean_path_length
             )
 
-            generator.zero_grad()
+            student_generator.zero_grad()
             weighted_path_loss = args.path_regularize * args.g_reg_every * path_loss
 
             if args.path_batch_shrink:
@@ -273,20 +326,23 @@ def train(args, loader, generator, discriminator, student_generator, student_dis
                 reduce_sum(mean_path_length).item() / get_world_size()
             )
 
+                                ##############################
+                                ### End of Train Generator ###
+                                ##############################
         loss_dict["path"] = path_loss
         loss_dict["path_length"] = path_lengths.mean()
 
-        accumulate(g_ema, g_module, accum)
+        accumulate(student_g_ema, g_module, accum)
 
         loss_reduced = reduce_loss_dict(loss_dict)
 
-        d_loss_val = loss_reduced["d"].mean().item()
         g_loss_val = loss_reduced["g"].mean().item()
-        r1_val = loss_reduced["r1"].mean().item()
+        d_loss_val = loss_reduced["d"].mean().item()
         path_loss_val = loss_reduced["path"].mean().item()
+        path_length_val = loss_reduced["path_length"].mean().item()
+        r1_val = loss_reduced["r1"].mean().item()
         real_score_val = loss_reduced["real_score"].mean().item()
         fake_score_val = loss_reduced["fake_score"].mean().item()
-        path_length_val = loss_reduced["path_length"].mean().item()
 
         if get_rank() == 0:
             pbar.set_description(
@@ -313,13 +369,13 @@ def train(args, loader, generator, discriminator, student_generator, student_dis
                     }
                 )
 
-            if i % 100 == 0:
+            if i % 1000 == 0:
                 with torch.no_grad():
-                    g_ema.eval()
-                    sample, _ = g_ema([sample_z])
+                    student_g_ema.eval()
+                    sample, _, _ = student_g_ema([sample_z])
                     utils.save_image(
                         sample,
-                        f"sample/{str(i).zfill(6)}.png",
+                        f"{save_dir}/sample/{str(i).zfill(6)}-student.png",
                         nrow=int(args.n_sample ** 0.5),
                         normalize=True,
                         range=(-1, 1),
@@ -330,19 +386,18 @@ def train(args, loader, generator, discriminator, student_generator, student_dis
                     {
                         "g": g_module.state_dict(),
                         "d": d_module.state_dict(),
-                        "g_ema": g_ema.state_dict(),
+                        "g_ema": student_g_ema.state_dict(),
                         "g_optim": g_optim.state_dict(),
                         "d_optim": d_optim.state_dict(),
                         "args": args,
                         "ada_aug_p": ada_aug_p,
                     },
-                    f"checkpoint/{str(i).zfill(6)}.pt",
+                    f"{save_dir}/checkpoints/{str(i).zfill(6)}.pt",
                 )
+                
 
 
 if __name__ == "__main__":
-    device = "cuda"
-
     parser = argparse.ArgumentParser(description="StyleGAN2 compression")
     parser.add_argument("--path", type=str, help="path to the lmdb dataset")
     parser.add_argument('--arch', type=str, default='stylegan2', help='model architectures (stylegan2 | swagan)')
@@ -358,6 +413,7 @@ if __name__ == "__main__":
     parser.add_argument("--g_reg_every",type=int,default=4,help="interval of the applying path length regularization",)
     parser.add_argument("--mixing", type=float, default=0.9, help="probability of latent code mixing")
     parser.add_argument("--ckpt",type=str,default=None,help="path to the checkpoints to resume training",)
+    parser.add_argument("--ckpt_s",type=str,default=None,help="path to the checkpoints to resume training of the student network",)
     parser.add_argument("--lr", type=float, default=0.002, help="learning rate")
     parser.add_argument("--channel_multiplier",type=int,default=2,help="channel multiplier factor for the model. config-f = 2, else = 1",)
     parser.add_argument("--channel_multiplier_s",type=int,default=1,help="channel multiplier factor for the student model. config-f = 2, else = 1",)
@@ -368,8 +424,15 @@ if __name__ == "__main__":
     parser.add_argument("--ada_target",type=float,default=0.6,help="target augmentation probability for adaptive augmentation",)
     parser.add_argument("--ada_length",type=int,default=500 * 1000,help="target duraing to reach augmentation probability for adaptive augmentation",)
     parser.add_argument("--ada_every",type=int,default=256,help="probability update interval of the adaptive augmentation",)
+    parser.add_argument("--kernel_alignment", action="store_true", default=False, help="Perform kernel alignment for knowledge distillation.")
+    parser.add_argument("--perc_loss", action="store_true", default=False, help="Perform perceptual loss to increase similarity of generated images.")
+    parser.add_argument("--inherit_style", action="store_true", default=False, help="Inherit parent style weight.")
+    parser.add_argument("--expr_dir", type=str, default='./expr', help="Define directory where checkpoints and samples will be stored.")
+    parser.add_argument("--gpu",type=str,default="cuda",help="select gpu id",)
 
     args = parser.parse_args()
+
+    device = f'cuda:{args.gpu}'
 
     n_gpu = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     args.distributed = n_gpu > 1
@@ -381,12 +444,10 @@ if __name__ == "__main__":
 
     args.latent = 512
     args.n_mlp = 8
-
     args.start_iter = 0
 
     if args.arch == 'stylegan2':
         from model import Generator, Discriminator
-
     elif args.arch == 'swagan':
         from swagan import Generator, Discriminator
 
@@ -408,17 +469,34 @@ if __name__ == "__main__":
     g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
     d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
 
+    # Student network
+    student_generator = Generator(
+        args.size_s, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier_s
+    ).to(device)
+
     g_optim = optim.Adam(
-        generator.parameters(),
+        student_generator.parameters(),
         lr=args.lr * g_reg_ratio,
         betas=(0 ** g_reg_ratio, 0.99 ** g_reg_ratio),
     )
+
+    student_discriminator = Discriminator(
+        args.size_s, channel_multiplier=args.channel_multiplier_s
+    ).to(device)
+
     d_optim = optim.Adam(
-        discriminator.parameters(),
+        student_discriminator.parameters(),
         lr=args.lr * d_reg_ratio,
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
 
+    student_g_ema = Generator(
+        args.size_s, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier_s
+    ).to(device)
+    student_g_ema.eval()
+    accumulate(student_g_ema, student_generator, 0)
+
+    # load teacher network
     if args.ckpt is not None:
         print("load model:", args.ckpt)
 
@@ -426,32 +504,37 @@ if __name__ == "__main__":
 
         try:
             ckpt_name = os.path.basename(args.ckpt)
-            args.start_iter = int(os.path.splitext(ckpt_name)[0])
-
+            # args.start_iter = int(os.path.splitext(ckpt_name)[0])
         except ValueError:
             pass
-
-        generator.load_state_dict(ckpt["g"])
+        
+        generator.load_state_dict(ckpt["g"], strict=False)
         discriminator.load_state_dict(ckpt["d"])
-        g_ema.load_state_dict(ckpt["g_ema"])
+        g_ema.load_state_dict(ckpt["g_ema"], strict=False)
 
-        g_optim.load_state_dict(ckpt["g_optim"])
-        d_optim.load_state_dict(ckpt["d_optim"])
+        # g_optim.load_state_dict(ckpt["g_optim"])
+        # d_optim.load_state_dict(ckpt["d_optim"])
 
-    # Student network
-    student_generator = Generator(
-        args.size_s, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier_s
-    ).to(device)
+        if args.inherit_style:
+            style_dict = { k: v for k,v in generator.state_dict().items() if 'style' in k }
+            student_generator.load_state_dict(style_dict, strict=False)
+            style_dict = { k: v for k,v in g_ema.state_dict().items() if 'style' in k }
+            student_g_ema.load_state_dict(style_dict, strict=False)
 
-    student_discriminator = Discriminator(
-        args.size_s, channel_multiplier=args.channel_multiplier_s
-    ).to(device)
+    # continue training student network
+    if args.ckpt_s is not None:
+        print(f"load student model: { args.ckpt_s }")
+        ckpt_s = torch.load(args.ckpt_s, map_location=lambda storage, loc: storage)
+        try:
+            ckpt_s_name = os.path.basename(args.ckpt_s)
+            args.start_iter = int(os.path.splitext(ckpt_s_name)[0])
+        except ValueError:
+            pass
+        student_generator.load_state_dict(ckpt["g"])
+        student_g_ema.load_state_dict(ckpt["g_ema"])
 
-    student_g_ema = Generator(
-        args.size_s, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier_s
-    ).to(device)
-    student_g_ema.eval()
-    accumulate(student_g_ema, student_generator, 0)
+        g_optim.load_state_dict(ckpt_s["g_optim"])
+        d_optim.load_state_dict(ckpt_s["d_optim"])
 
     # for distributed training
     if args.distributed:
@@ -470,14 +553,14 @@ if __name__ == "__main__":
         )
 
         student_generator = nn.parallel.DistributedDataParallel(
-            generator,
+            student_generator,
             device_ids=[args.local_rank],
             output_device=args.local_rank,
             broadcast_buffers=False,
         )
 
         student_discriminator = nn.parallel.DistributedDataParallel(
-            discriminator,
+            student_discriminator,
             device_ids=[args.local_rank],
             output_device=args.local_rank,
             broadcast_buffers=False,
@@ -491,7 +574,7 @@ if __name__ == "__main__":
         ]
     )
 
-    dataset = MultiResolutionDataset(args.path, transform, args.size)
+    dataset = MultiResolutionDataset(args.path, transform, args.size_s) # load student size
     loader = data.DataLoader(
         dataset,
         batch_size=args.batch,
