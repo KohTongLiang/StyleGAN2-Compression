@@ -280,11 +280,9 @@ def train(args, loader, generator, discriminator, student_generator, student_dis
         if args.kernel_alignment:
             dist_loss = 0 # for knowledge distillation
             for f_s, f_t in zip(f_maps_s, f_maps_t):
-                f_t = F.interpolate(f_t, args.size_s, mode="bilinear")
                 dist_loss += KA(f_s, f_t)
             dist_loss = -dist_loss # we want to maximise it
             g_loss = g_loss + dist_loss
-
 
         # Perceptual Loss
         # causes stack expects each tensor to be equal size, but got [4, 1, 1, 1] at entry 0 and [] at entry 1
