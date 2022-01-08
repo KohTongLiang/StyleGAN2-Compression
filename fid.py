@@ -76,7 +76,7 @@ if __name__ == "__main__":
     ckpt = torch.load(args.ckpt)
 
     g = Generator(args.size, 512, 8, channel_multiplier=args.channel_multiplier).to(device)
-    g.load_state_dict(ckpt["g_ema"])
+    g.load_state_dict(ckpt["g_ema"], strict=False)
     g = nn.DataParallel(g)
     g.eval()
 
